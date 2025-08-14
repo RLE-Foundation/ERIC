@@ -26,6 +26,8 @@ from PIL import Image
 from peft import LoraConfig, get_peft_model
 from torch import nn, optim
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard.writer import SummaryWriter
 from transformers import AutoModelForVision2Seq, AutoProcessor
 from transformers import AutoConfig, AutoImageProcessor
@@ -97,6 +99,8 @@ class Args:
     """the entity (team) of wandb's project"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
+    debug: bool = False
+    """whether to use debugpy"""
 
     # VLA arguments
     vla_model_path: str = "/home/zixiao/models/openvla-7b-finetuned-libero-spatial"
@@ -125,7 +129,7 @@ class Args:
     """the discount factor gamma"""
     gae_lambda: float = 0.95
     """the lambda for the general advantage estimation"""
-    num_minibatches: int = 4
+    num_minibatches: int = 100
     """the number of mini-batches"""
     update_epochs: int = 4
     """the K epochs to update the policy"""
@@ -487,6 +491,51 @@ class Agent(nn.Module):
         return action_log_probs, values
 
 
+class PPODataset(Dataset):
+    """
+    PPO训练数据的Dataset类，用于配合DataLoader和DistributedSampler进行分布式训练
+    """
+    def __init__(self, sequences, attention_mask, pixel_values, logprobs, advantages, returns, values):
+        """
+        Args:
+            sequences (torch.Tensor): [batch_size, max_seq_len + 7] 完整的输入序列和action tokens
+            attention_mask (torch.Tensor): [batch_size, max_seq_len] 注意力掩码
+            pixel_values (torch.Tensor): [batch_size, 6, 224, 224] 图像数据
+            logprobs (torch.Tensor): [batch_size] 动作的对数概率
+            advantages (torch.Tensor): [batch_size] 优势值
+            returns (torch.Tensor): [batch_size] 回报值
+            values (torch.Tensor): [batch_size] 状态值
+        """
+        self.sequences = sequences
+        self.attention_mask = attention_mask
+        self.pixel_values = pixel_values
+        self.logprobs = logprobs
+        self.advantages = advantages
+        self.returns = returns
+        self.values = values
+        
+        # 确保所有数据的batch_size一致
+        assert len(sequences) == len(attention_mask) == len(pixel_values) == len(logprobs) == len(advantages) == len(returns) == len(values)
+        
+        # 给每个样本分配连续ID，验证分布式数据采样
+        self.sample_ids = torch.arange(len(sequences))
+        
+    def __len__(self):
+        return len(self.sequences)
+    
+    def __getitem__(self, idx):
+        return {
+            'sequences': self.sequences[idx],
+            'attention_mask': self.attention_mask[idx],
+            'pixel_values': self.pixel_values[idx],
+            'logprobs': self.logprobs[idx],
+            'advantages': self.advantages[idx],
+            'returns': self.returns[idx],
+            'values': self.values[idx],
+            'sample_id': self.sample_ids[idx]
+        }
+
+
 def main():
     # DDP setup
     assert torch.cuda.is_available(), "CUDA is not available"
@@ -525,6 +574,14 @@ def main():
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
+    
+    # 调试设置 - 只在rank 0进程中启用远程调试
+    if int(os.environ.get('LOCAL_RANK', 0)) == 0 and args.debug:
+        import debugpy
+        debugpy.listen(5678)
+        print("等待调试器连接到端口 5678...")
+        debugpy.wait_for_client()
+        print("调试器已连接!")
 
     # TRY NOT TO MODIFY: seeding
     # TODO: 要不要使用上面的函数
@@ -700,10 +757,38 @@ def main():
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
 
-        # TODO: 这里的数据采样要使用dataloader+DistributedSampler
+        # 使用DataLoader和DistributedSampler进行数据采样
+        # 创建PPO数据集
+        dataset = PPODataset(
+            sequences=b_sequences,
+            attention_mask=b_attention_mask,
+            pixel_values=b_pixel_values,
+            logprobs=b_logprobs,
+            advantages=b_advantages,
+            returns=b_returns,
+            values=b_values
+        )
+        
+        # 创建DistributedSampler
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=dist.get_world_size(),
+            rank=dist.get_rank(),
+            shuffle=True,
+            drop_last=False
+        )
+        
+        # 创建DataLoader
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.minibatch_size,
+            sampler=sampler,
+            num_workers=0,  # 设为0避免多进程问题
+            pin_memory=False,  # 数据在GPU上，不需要pin_memory
+            drop_last=False
+        )
 
         # Optimizing the policy and value network
-        b_inds = np.arange(args.batch_size)
         clipfracs = []
         
         # 初始化变量以避免可能未定义的错误
@@ -715,18 +800,30 @@ def main():
         
         print("Update...")
         for epoch in range(args.update_epochs):
-            np.random.shuffle(b_inds)
-            for start in tqdm(range(0, args.batch_size, args.minibatch_size), desc=f"Epoch {epoch + 1}/{args.update_epochs}"):
-                end = start + args.minibatch_size
-                mb_inds = b_inds[start:end]
+            # 设置sampler的epoch，确保每个epoch的数据shuffle不同
+            sampler.set_epoch(epoch)
+            batch_count = 0
+            rank_data_ids = []
+            
+            for batch in tqdm(dataloader, desc=f"Epoch {epoch + 1}/{args.update_epochs}"):
+                # 从batch中提取数据
+                mb_sequences = batch['sequences']
+                mb_attention_mask = batch['attention_mask']
+                mb_pixel_values = batch['pixel_values']
+                mb_logprobs = batch['logprobs']
+                mb_advantages = batch['advantages']
+                mb_returns = batch['returns']
+                mb_values = batch['values']
+                mb_sample_ids = batch['sample_id']
+                rank_data_ids.extend(mb_sample_ids.cpu().tolist())
 
                 # 重新编码轨迹数据以计算新的log概率和values
                 newlogprob, newvalue = agent.encode_traj(
-                    b_sequences[mb_inds], 
-                    b_attention_mask[mb_inds], 
-                    b_pixel_values[mb_inds], 
+                    mb_sequences, 
+                    mb_attention_mask, 
+                    mb_pixel_values, 
                 )
-                logratio = newlogprob - b_logprobs[mb_inds]
+                logratio = newlogprob - mb_logprobs
                 ratio = logratio.exp()
 
                 with torch.no_grad():
@@ -735,7 +832,7 @@ def main():
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
-                mb_advantages = b_advantages[mb_inds]
+                # 对优势值进行归一化
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
@@ -747,17 +844,17 @@ def main():
                 # Value loss
                 newvalue = newvalue.view(-1)
                 if args.clip_vloss:
-                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                    v_clipped = b_values[mb_inds] + torch.clamp(
-                        newvalue - b_values[mb_inds],
+                    v_loss_unclipped = (newvalue - mb_returns) ** 2
+                    v_clipped = mb_values + torch.clamp(
+                        newvalue - mb_values,
                         -args.clip_coef,
                         args.clip_coef,
                     )
-                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
+                    v_loss_clipped = (v_clipped - mb_returns) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
                     v_loss = 0.5 * v_loss_max.mean()
                 else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                    v_loss = 0.5 * ((newvalue - mb_returns) ** 2).mean()
 
                 # TODO: entropy loss 暂时去掉，设置为0
                 entropy_loss = torch.tensor(0.0, device=device)
@@ -767,6 +864,10 @@ def main():
                 loss.backward()
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
+                batch_count += 1
+            
+            rank_data_ids.sort()
+            print(f"Mini-batch finish: Rank={dist.get_rank()}, Sample IDs={rank_data_ids}")
 
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
@@ -793,12 +894,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # 调试设置 - 只在rank 0进程中启用远程调试
-    import os
-    if int(os.environ.get('LOCAL_RANK', 0)) == 0:
-        import debugpy
-        debugpy.listen(5678)
-        print("等待调试器连接到端口 5678...")
-        debugpy.wait_for_client()
-        print("调试器已连接!")
     main()
