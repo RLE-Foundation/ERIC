@@ -105,6 +105,8 @@ class Args:
     """the rank of the LoRA matrix"""
     lora_dropout: float = 0.0
     """the dropout rate of the LoRA matrix"""
+    max_seq_len: int = 128
+    """the maximum sequence length of the input"""
 
     # Algorithm specific arguments
     env_id: str = "BreakoutNoFrameskip-v4"
@@ -332,21 +334,60 @@ class Agent(nn.Module):
         values = self.value_head(hidden_states)
 
         return values
-    
-    def evaluate(self, input_ids, attention_mask, pixel_values, **kwargs):
-        pass
-    
-    def process_to_inputs(self, prompt: str, obs_img: Image.Image, **kwargs):
+
+    def process_to_inputs(self, prompt: str, obs_img: Image.Image, seq_len: int, **kwargs):
         """给输入数据编码，给定prompt和obs_img，返回query_inputs
 
         Args:
             prompt (str): prompt
             obs_img (Image.Image): observation image
+            seq_len (int): 目标序列长度，会进行padding或截断到此长度
 
         Returns:
             dict: query inputs
         """
+        # 先不设置max_length，让processor正常处理
         query_inputs = self.processor(prompt, obs_img, **kwargs).to(self.device, dtype=torch.bfloat16)
+
+        input_ids = query_inputs['input_ids']
+        attention_mask = query_inputs['attention_mask']
+        
+        # 追加特殊token 29871（如果需要）
+        if not torch.all(input_ids[:, -1] == 29871):
+            input_ids = torch.cat(
+                (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1
+            )
+            attention_mask = torch.cat(
+                (attention_mask, torch.unsqueeze(torch.Tensor([1]).long(), dim=0).to(attention_mask.device)), dim=1
+            )
+        
+        # 根据seq_len进行左侧padding或截断
+        current_length = input_ids.shape[1]
+        if current_length < seq_len:
+            # 需要左侧padding
+            pad_length = seq_len - current_length
+            # 使用tokenizer的pad_token_id进行padding，如果没有则使用32000
+            pad_token_id = getattr(self.processor.tokenizer, 'pad_token_id', 32000)
+            
+            # 左侧padding input_ids
+            pad_ids = torch.full((input_ids.shape[0], pad_length), pad_token_id, 
+                               dtype=input_ids.dtype, device=input_ids.device)
+            input_ids = torch.cat([pad_ids, input_ids], dim=1)
+            
+            # 左侧padding attention_mask (padding部分设为0)
+            pad_mask = torch.zeros((attention_mask.shape[0], pad_length), 
+                                 dtype=attention_mask.dtype, device=attention_mask.device)
+            attention_mask = torch.cat([pad_mask, attention_mask], dim=1)
+            
+        elif current_length > seq_len:
+            # 需要截断（从左侧截断，保留右侧的实际内容）
+            print("Warning: input_ids length exceed max_seq_len, will be truncated!")
+            input_ids = input_ids[:, -seq_len:]
+            attention_mask = attention_mask[:, -seq_len:]
+        
+        query_inputs['input_ids'] = input_ids
+        query_inputs['attention_mask'] = attention_mask
+        
         return query_inputs
 
     def act_rollout(self, query_inputs):
@@ -362,13 +403,6 @@ class Agent(nn.Module):
             values (torch.Tensor): values
             log_probs (torch.Tensor): log probabilities
         """
-        input_ids = query_inputs['input_ids']
-        if not torch.all(input_ids[:, -1] == 29871):
-            input_ids = torch.cat(
-                (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1
-            )
-        query_inputs['input_ids'] = input_ids
-        
         outputs = self.vla_base.module.generate(
             **query_inputs,
             max_new_tokens=7,
@@ -400,7 +434,57 @@ class Agent(nn.Module):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             values = self.value_head(hidden_states)
 
-        return actions, action_token_ids, values, log_probs
+        return actions, values, log_probs, outputs.sequences
+
+    def encode_traj(self, sequences, attention_mask, pixel_values):
+        """对已经采集的动作重新编码一次，用于计算梯度
+
+        Args:
+            sequences (torch.Tensor): shape: [batch_size, max_seq_len + 7] 包含完整的输入序列和action tokens
+            attention_mask (torch.Tensor): shape: [batch_size, max_seq_len]
+            pixel_values (torch.Tensor): shape: [batch_size, 6, 224, 224]
+        
+        Returns:
+            action_log_probs (torch.Tensor): shape: [batch_size] 动作的对数概率
+            values (torch.Tensor): shape: [batch_size] 状态值
+        """
+        # 扩展attention_mask以匹配sequences的长度
+        batch_size, seq_len = sequences.shape
+        extended_attention_mask = torch.ones(batch_size, seq_len, device=attention_mask.device, dtype=attention_mask.dtype)
+        extended_attention_mask[:, :attention_mask.shape[1]] = attention_mask
+        
+        # 直接使用完整的sequences进行前向传播
+        outputs = self.vla_base(
+            input_ids=sequences,
+            attention_mask=extended_attention_mask,
+            pixel_values=pixel_values,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        
+        # 获取logits
+        logits = outputs.logits  # [batch_size, seq_len, vocab_size]
+        
+        # logits[:, -8:-1, :] 对应预测 sequences[:, -7:] (最后7个action tokens)
+        action_logits = logits[:, -8:-1, :]  # [batch_size, 7, vocab_size]
+        
+        # 获取最后7个位置的token ids（对应action tokens）
+        action_token_ids = sequences[:, -7:]  # [batch_size, 7]
+        
+        # 计算log probabilities
+        log_probs = torch.log_softmax(action_logits, dim=-1)  # [batch_size, 7, vocab_size]
+        
+        # 获取实际选择的action tokens的log prob
+        action_log_probs = log_probs.gather(dim=-1, index=action_token_ids.unsqueeze(-1)).squeeze(-1)  # [batch_size, 7]
+        
+        # 对整个action序列求和得到总的log prob
+        action_log_probs = action_log_probs.sum(dim=-1)  # [batch_size]
+        
+        # 计算value
+        hidden_states = outputs.hidden_states[-1][:, -1, :].float()  # [batch_size, hidden_size]
+        values = self.value_head(hidden_states).squeeze(-1)  # [batch_size]
+        
+        return action_log_probs, values
 
 
 def main():
@@ -455,10 +539,9 @@ def main():
     action_space = gym.spaces.Box(low=-1, high=1, shape=(7,), dtype=np.float32)
     envs = None
     if distributed_state.is_main_process:
-        # TODO: 这里的设置要和config同步
         # TODO: 没有根据num_envs设置envs，目前仅支持num_envs=1
         assert args.num_envs == 1, "Currently only support num_envs=1"
-        envs = LiberoEnv(task_suite_name='libero_spatial', task_id=0, seed=0, max_steps=220, init_state_id=0)
+        envs = LiberoEnv(task_suite_name='libero_spatial', task_id=0, seed=args.seed, max_steps=args.num_steps, init_state_id=0)
 
     # VLA setup
     AutoConfig.register("openvla", OpenVLAConfig)
@@ -496,9 +579,14 @@ def main():
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
-    # 轨迹数据，在所有 GPU 上创建一份，rollout结束后，子进程会从主进程接收广播数据
-    obs = torch.zeros((args.num_steps, args.num_envs) + observation_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs) + action_space.shape).to(device)
+    # 收集数据，在所有 GPU 上创建一份，rollout结束后，子进程会从主进程接收广播数据
+    # 轨迹数据，用于计算梯度
+    traj_obs = torch.zeros((args.num_steps, args.num_envs) + observation_space.shape, dtype=torch.bfloat16).to(device)
+    traj_attention_mask = torch.zeros((args.num_steps, args.num_envs, args.max_seq_len), dtype=torch.long).to(device)
+    # 加入 padding 后的完整输出序列，用于再次计算梯度
+    traj_sequences = torch.zeros((args.num_steps, args.num_envs, args.max_seq_len + 7), dtype=torch.long).to(device)
+    
+    # RL 算法需要的数据
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -534,25 +622,26 @@ def main():
         if distributed_state.is_main_process:
             assert obs_img is not None and next_done is not None and envs is not None
             
-            # TODO: 只 rollout 了一条轨迹
             print("Rollout...")
             for step in tqdm(range(0, args.num_steps), desc="Rollout Progress"):
                 global_step += args.num_envs
                 
                 # 输入编码，得到 query_inputs
-                query_inputs = agent.process_to_inputs(envs.prompt, obs_img)
+                query_inputs = agent.process_to_inputs(envs.prompt, obs_img, args.max_seq_len)
                 # input_ids.shape = [num_envs, len]
                 # attention_mask.shape = [num_envs, len]
                 # pixel_values.shape = [num_envs, 6, 224, 224]
-                
-                obs[step, :] = query_inputs['pixel_values'].to(device)
-                dones[step, :] = next_done
 
                 # ALGO LOGIC: action logic
                 with torch.no_grad():
-                    action, action_token_ids, value, logprob = agent.act_rollout(query_inputs)
+                    action, value, logprob, sequences = agent.act_rollout(query_inputs)
                     values[step, :] = value.flatten()
-                actions[step, :] = action_token_ids
+                
+                # 记录轨迹数据
+                traj_sequences[step, :] = sequences
+                traj_attention_mask[step, :] = query_inputs['attention_mask']
+                traj_obs[step, :] = query_inputs['pixel_values'].to(device)
+                dones[step, :] = next_done
                 logprobs[step, :] = logprob
 
                 # TRY NOT TO MODIFY: execute the game and log data.
@@ -588,25 +677,25 @@ def main():
         
         # broadcast数据到所有进程
         dist.barrier()
-        dist.broadcast(obs, src=0)
-        dist.broadcast(actions, src=0)
+        dist.broadcast(traj_obs, src=0)
+        dist.broadcast(traj_sequences, src=0)
+        dist.broadcast(traj_attention_mask, src=0)
         dist.broadcast(logprobs, src=0)
         dist.broadcast(rewards, src=0)
         dist.broadcast(advantages, src=0)
         dist.broadcast(values, src=0)
         dist.broadcast(returns, src=0)
-        dist.broadcast(dones, src=0)
-        print("================================================ finish")
-        exit()
+
 
         # ==================================================================================================================
         # Stage 3: Update
         # ==================================================================================================================
         # NOTE: all the GPUs will do the update together
         # flatten the batch
-        b_obs = obs.reshape((-1,) + envs.observation_space.shape)
+        b_sequences = traj_sequences.reshape((-1, args.max_seq_len + 7))
+        b_attention_mask = traj_attention_mask.reshape((-1, args.max_seq_len))
+        b_pixel_values = traj_obs.reshape((-1,) + observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,) + envs.action_space.shape)
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
@@ -616,14 +705,27 @@ def main():
         # Optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
         clipfracs = []
+        
+        # 初始化变量以避免可能未定义的错误
+        approx_kl = torch.tensor(0.0, device=device)
+        old_approx_kl = torch.tensor(0.0, device=device)
+        v_loss = torch.tensor(0.0, device=device)
+        pg_loss = torch.tensor(0.0, device=device)
+        entropy_loss = torch.tensor(0.0, device=device)
+        
+        print("Update...")
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
-            for start in range(0, args.batch_size, args.minibatch_size):
+            for start in tqdm(range(0, args.batch_size, args.minibatch_size), desc=f"Epoch {epoch + 1}/{args.update_epochs}"):
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                # TODO: 实现get_action_and_value
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+                # 重新编码轨迹数据以计算新的log概率和values
+                newlogprob, newvalue = agent.encode_traj(
+                    b_sequences[mb_inds], 
+                    b_attention_mask[mb_inds], 
+                    b_pixel_values[mb_inds], 
+                )
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
@@ -657,8 +759,8 @@ def main():
                 else:
                     v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
-                # TODO: entropy loss 暂时去掉
-                entropy_loss = entropy.mean()
+                # TODO: entropy loss 暂时去掉，设置为0
+                entropy_loss = torch.tensor(0.0, device=device)
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
                 optimizer.zero_grad()
@@ -691,4 +793,12 @@ def main():
 
 
 if __name__ == "__main__":
+    # 调试设置 - 只在rank 0进程中启用远程调试
+    import os
+    if int(os.environ.get('LOCAL_RANK', 0)) == 0:
+        import debugpy
+        debugpy.listen(5678)
+        print("等待调试器连接到端口 5678...")
+        debugpy.wait_for_client()
+        print("调试器已连接!")
     main()
