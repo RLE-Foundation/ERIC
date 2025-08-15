@@ -1,0 +1,59 @@
+# ERIC Framework Dependencies
+# Verified against actual eric conda environment
+
+# Core ML and Vision-Language (OpenVLA base)
+torch==2.2.0
+torchvision==0.17.0
+torchaudio==2.2.0
+transformers==4.40.1
+accelerate==0.25.0
+peft==0.11.1
+tokenizers==0.19.1
+timm==0.9.10
+sentencepiece==0.1.99
+
+# Note: ERIC includes its own prismatic/ modules (OpenVLA components)
+
+# Scientific computing
+numpy==1.26.4
+matplotlib
+pillow
+tqdm
+einops
+protobuf
+
+# Data processing
+tensorflow==2.15.0
+tensorflow_datasets==4.9.3
+tensorflow_graphics==2021.12.3
+huggingface_hub
+json-numpy
+jsonlines
+
+# Robotics and RL
+# libero  # Install separately from source (see README)
+gym==0.26.2
+mujoco==3.3.5
+robosuite==1.4.1
+bddl==3.6.0
+tyro
+
+# Data utilities
+cloudpickle==3.1.1
+easydict==1.13
+imageio[ffmpeg]==2.37.0
+
+# Training and monitoring
+wandb
+tensorboard
+draccus==0.8.0
+rich
+
+# OpenVLA data processing
+dlimp @ git+https://github.com/moojink/dlimp_openvla
+
+# Performance critical (install separately):
+# flash-attn==2.5.5
+
+# Development (optional):
+# debugpy
