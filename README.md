@@ -8,7 +8,7 @@
 **Embodied Reinforcement IntelligenCe (ERIC)** is a framework that provides high-quality single-file implementations for finetuning vision-language-action (VLA) models via reinforcement learning. Following the design philosophy of [CleanRL](https://github.com/vwxyzjn/cleanrl), ERIC is clean and simple, accelerating your research with user-friendly features. The highlight features of CleanRL are:
 - 📜 Single-file implementation
 
-# Fintuning VLA with RL from Scratch
+# Finetuning VLA with RL from Scratch
 
 First time in this area? 
 
