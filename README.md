@@ -16,7 +16,7 @@ Don't worry, we provide a great notebook that helps you understand this area and
 
 See [Fintuning VLA with RL from Scratch]().
 
-# Environment Setup
+# Quick Start
 
 ### Prerequisites
 
