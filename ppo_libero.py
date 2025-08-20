@@ -157,7 +157,7 @@ class Args:
     """the number of iterations (computed in runtime)"""
 
 class LiberoEnv(gym.Env):
-    def __init__(self, task_suite_name, task_id, seed, max_steps, init_state_id):
+    def __init__(self, task_suite_name, task_id, max_steps, init_state_id):
         """
         Args:
             task_suite_name (str): Name of the task suite
@@ -172,7 +172,6 @@ class LiberoEnv(gym.Env):
         # Set the task information
         self.task_id = task_id
         self.task_suite_name = task_suite_name
-        self.seed = seed
         self.max_steps = max_steps
         self.init_state_id = init_state_id
         
@@ -187,7 +186,6 @@ class LiberoEnv(gym.Env):
         task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
         
         self.env = OffScreenRenderEnv(bddl_file_name=task_bddl_file, camera_heights=128, camera_widths=128)
-        self.env.seed(seed)
 
         # Get the initial states
         self.initial_states = task_suite.get_task_init_states(task_id)
@@ -203,17 +201,18 @@ class LiberoEnv(gym.Env):
 
         # Update the current step
         self.current_step += 1
-        # TODO: 这里没有区分 truncate 和 done
-        if self.current_step >= self.max_steps:
-            done = True
+
+        truncated = self.current_step >= self.max_steps
         
         # Update the info
         info["prompt"] = self.prompt
 
-        return visual_obs, reward, done, info
+        # TODO: 日志记录这里的数据
+        return visual_obs, reward, done, truncated, info
     
-    def reset(self):
+    def reset(self, *, seed=None, options=None):
         # Reset the environment
+        self.env.seed(seed)
         self.env.reset()
         # Set the initial state
         self.env.set_state(self.init_state)
@@ -598,7 +597,7 @@ def main():
     if distributed_state.is_main_process:
         # TODO: 没有根据num_envs设置envs，目前仅支持num_envs=1
         assert args.num_envs == 1, "Currently only support num_envs=1"
-        envs = LiberoEnv(task_suite_name='libero_spatial', task_id=0, seed=args.seed, max_steps=args.num_steps, init_state_id=0)
+        envs = LiberoEnv(task_suite_name='libero_spatial', task_id=0, max_steps=args.num_steps, init_state_id=0)
 
     # VLA setup
     AutoConfig.register("openvla", OpenVLAConfig)
@@ -654,11 +653,6 @@ def main():
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
-    obs_img = next_done = None
-    if distributed_state.is_main_process:
-        assert envs is not None, "envs should be initialized in main process"
-        obs_img, info = envs.reset()
-        next_done = torch.zeros(args.num_envs).to(device)
 
     # 大循环，内部先 rollout 再更新
     for iteration in range(1, args.num_iterations + 1):
@@ -677,7 +671,12 @@ def main():
         # ==================================================================================================================
         # NOTE: only the main process will do the action
         if distributed_state.is_main_process:
-            assert obs_img is not None and next_done is not None and envs is not None
+            assert envs is not None
+            
+            # Reset environment at the beginning of each iteration to start a new episode
+            print("Resetting environment for new episode...")
+            obs_img, info = envs.reset(seed=args.seed)
+            next_done = torch.zeros(args.num_envs).to(device)
             
             print("Rollout...")
             for step in tqdm(range(0, args.num_steps), desc="Rollout Progress"):
@@ -704,10 +703,11 @@ def main():
                 # TRY NOT TO MODIFY: execute the game and log data.
                 # action.shape: [batch_size, 7]
                 # TODO: 暂时不支持 batch_size > 1 时的仿真
-                obs_img, reward, done, infos = envs.step(action[0])
+                obs_img, reward, done, truncated, infos = envs.step(action[0])
                 
                 rewards[step, :] = torch.tensor(reward).to(device).view(-1)
-                next_done = torch.Tensor([done]).to(device)
+                # TODO: 这里没有区分 truncate 和 done
+                next_done = torch.Tensor([done or truncated]).to(device)
 
                 if "final_info" in infos:
                     for info in infos["final_info"]:
