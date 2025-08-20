@@ -18,7 +18,7 @@ from libero.libero.envs import OffScreenRenderEnv
 
 
 class LiberoEnv(gym.Env):
-    def __init__(self, task_suite_name, task_id, max_steps, init_state_id, seed):
+    def __init__(self, task_suite_name, task_id, max_steps, init_state_id, seed, height=128, width=128):
         """
         Args:
             task_suite_name (str): Name of the task suite
@@ -36,6 +36,8 @@ class LiberoEnv(gym.Env):
         self.max_steps = max_steps
         self.init_state_id = init_state_id
         self.seed = seed
+        self.height = height
+        self.width = width
         
         # Create the environment
         benchmark_dict = benchmark.get_benchmark_dict()
@@ -43,11 +45,10 @@ class LiberoEnv(gym.Env):
         task = task_suite.get_task(task_id)
         self.task_name = task.name
         self.task_description = task.language
-        self.prompt = "In: What action should the robot take to {<INSTRUCTION>}?\nOut:"
-        self.prompt = self.prompt.replace("<INSTRUCTION>", self.task_description)
+        self.prompt = f"In: What action should the robot take to {self.task_description.lower()}?\nOut:"
         task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
         
-        self.env = OffScreenRenderEnv(bddl_file_name=task_bddl_file, camera_heights=128, camera_widths=128)
+        self.env = OffScreenRenderEnv(bddl_file_name=task_bddl_file, camera_heights=self.height, camera_widths=self.width)
 
         # Get the initial states
         self.initial_states = task_suite.get_task_init_states(task_id)
@@ -73,6 +74,7 @@ class LiberoEnv(gym.Env):
         
         # Update the info
         info["prompt"] = self.prompt
+        info["success"] = done
 
         return visual_obs, reward, done, truncated, info
     
@@ -97,6 +99,7 @@ class LiberoEnv(gym.Env):
 
         # Update the info
         info['prompt'] = self.prompt
+        info['success'] = done
 
         return visual_obs, info
 
@@ -136,7 +139,7 @@ class LiberoEnv(gym.Env):
         action[..., -1] = action[..., -1] * -1.0
         return action
     
-    def get_visual_obs(self, obs, resize_size=(224, 224)):
+    def get_visual_obs(self, obs, resize_size=None):
         """
         Get the visual observation from the environment.
 
@@ -151,6 +154,8 @@ class LiberoEnv(gym.Env):
         # NOTE: rotate 180 degrees to match train preprocessing
         agentview_image = agentview_image[::-1, ::-1]
         # Resize to image size expected by model
+        if resize_size is None:
+            resize_size = (self.height, self.width)
         assert isinstance(resize_size, tuple)
         img = tf.image.encode_jpeg(agentview_image)
         img = tf.io.decode_image(img, expand_animations=False, dtype=tf.uint8)  # Immediately decode back
@@ -160,7 +165,7 @@ class LiberoEnv(gym.Env):
         # 返回numpy数组而不是PIL Image，以便与observation_space一致
         return img.numpy().astype(np.uint8)
     
-    def get_visual_obs_as_pil(self, obs, resize_size=(224, 224)):
+    def get_visual_obs_as_pil(self, obs, resize_size=None):
         """
         Get the visual observation as PIL Image (for compatibility with existing code).
 
@@ -171,13 +176,15 @@ class LiberoEnv(gym.Env):
         Returns:
             PIL.Image: Visual observation as PIL Image.
         """
+        if resize_size is None:
+            resize_size = (self.height, self.width)
         img_array = self.get_visual_obs(obs, resize_size)
         img = Image.fromarray(img_array)
         img = img.convert("RGB")
         return img
 
 
-def register_libero_env(task_suite_name='libero_spatial', task_id=0, max_steps=250, init_state_id=0, seed=42):
+def register_libero_env(task_suite_name='libero_spatial', task_id=0, max_steps=250, init_state_id=0, seed=42, height=128, width=128):
     """注册LIBERO环境到gym环境注册表
     
     Args:
@@ -204,7 +211,9 @@ def register_libero_env(task_suite_name='libero_spatial', task_id=0, max_steps=2
                 'task_id': task_id,
                 'max_steps': max_steps,
                 'init_state_id': init_state_id,
-                'seed': seed
+                'seed': seed,
+                'height': height,
+                'width': width
             },
             nondeterministic=True
         )
@@ -216,7 +225,7 @@ def register_libero_env(task_suite_name='libero_spatial', task_id=0, max_steps=2
 
 
 def make_libero_vec_env(task_suite_name='libero_spatial', task_id=0, max_steps=250, 
-                       init_state_id=0, seed=42, num_envs=1) -> gymnasium.vector.VectorEnv:
+                       init_state_id=0, seed=42, num_envs=1, height=128, width=128) -> gymnasium.vector.VectorEnv:
     """创建LIBERO向量化环境
     
     Args:
@@ -236,7 +245,9 @@ def make_libero_vec_env(task_suite_name='libero_spatial', task_id=0, max_steps=2
         task_id=task_id,
         max_steps=max_steps,
         init_state_id=init_state_id,
-        seed=seed
+        seed=seed,
+        height=height,
+        width=width
     )
     
     # 创建向量化环境

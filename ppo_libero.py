@@ -16,7 +16,7 @@ import torch.distributed as dist
 
 import gymnasium as gym
 import time
-from typing import Optional
+from typing import Optional, Dict
 from tqdm import tqdm
 
 from accelerate import PartialState
@@ -36,6 +36,7 @@ from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, Pr
 
 from libero_gym import make_libero_vec_env
 from PIL import Image
+from trajectory_logger import TrajectoryLogger
 
 
 def set_random_seed(seed: int = 42):
@@ -100,6 +101,8 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
     debug: bool = False
     """whether to use debugpy"""
+    save_log: bool = False
+    """whether to save trajectory data (videos and CSV files)"""
 
     # VLA arguments
     vla_model_path: str = "/home/zixiao/models/openvla-7b-finetuned-libero-spatial"
@@ -157,14 +160,14 @@ class Agent(nn.Module):
     def __init__(
         self, 
         vla_base, 
-        action_tokenizer, 
         processor,
-        device
+        device,
+        unnorm_key,
+        vla_config: OpenVLAConfig
     ):
         super().__init__()
 
         self.vla_base = vla_base
-        self.action_tokenizer = action_tokenizer
         self.processor = processor
         self.device = device
         self.config = vla_base.module.config.text_config
@@ -179,6 +182,18 @@ class Agent(nn.Module):
             nn.ReLU(),
             nn.Linear(512, 1, bias=False),
         )
+        
+        # for action decoding
+        self.vla_config = vla_config
+        self.unnorm_key = unnorm_key
+        assert self.vla_config.norm_stats is not None, "norm_stats is not found in config"
+        self.norm_stats: Dict = self.vla_config.norm_stats
+        assert self.unnorm_key in self.norm_stats, f"unnorm_key {self.unnorm_key} not found in norm_stats"
+        # Compute action bins
+        self.bins = np.linspace(-1, 1, vla_config.n_action_bins)
+        self.bin_centers = (self.bins[:-1] + self.bins[1:]) / 2.0
+        # Compute vocab size for de-tokenization -- revert added "multiple of"
+        self.vocab_size = self.vla_config.text_config.vocab_size - self.vla_config.pad_to_multiple_of
     
     def get_value(self, input_ids, attention_mask, pixel_values, **kwargs,):
         # TODO: value net 的实例问题
@@ -224,29 +239,30 @@ class Agent(nn.Module):
                 (attention_mask, torch.unsqueeze(torch.Tensor([1]).long(), dim=0).to(attention_mask.device)), dim=1
             )
         
+        # TODO: padding 会导致输出错误
         # 根据seq_len进行左侧padding或截断
-        current_length = input_ids.shape[1]
-        if current_length < seq_len:
-            # 需要左侧padding
-            pad_length = seq_len - current_length
-            # 使用tokenizer的pad_token_id进行padding，如果没有则使用32000
-            pad_token_id = getattr(self.processor.tokenizer, 'pad_token_id', 32000)
+        # current_length = input_ids.shape[1]
+        # if current_length < seq_len:
+        #     # 需要左侧padding
+        #     pad_length = seq_len - current_length
+        #     # 使用tokenizer的pad_token_id进行padding，如果没有则使用32000
+        #     pad_token_id = getattr(self.processor.tokenizer, 'pad_token_id', 32000)
             
-            # 左侧padding input_ids
-            pad_ids = torch.full((input_ids.shape[0], pad_length), pad_token_id, 
-                               dtype=input_ids.dtype, device=input_ids.device)
-            input_ids = torch.cat([pad_ids, input_ids], dim=1)
+        #     # 左侧padding input_ids
+        #     pad_ids = torch.full((input_ids.shape[0], pad_length), pad_token_id, 
+        #                        dtype=input_ids.dtype, device=input_ids.device)
+        #     input_ids = torch.cat([pad_ids, input_ids], dim=1)
             
-            # 左侧padding attention_mask (padding部分设为0)
-            pad_mask = torch.zeros((attention_mask.shape[0], pad_length), 
-                                 dtype=attention_mask.dtype, device=attention_mask.device)
-            attention_mask = torch.cat([pad_mask, attention_mask], dim=1)
+        #     # 左侧padding attention_mask (padding部分设为0)
+        #     pad_mask = torch.zeros((attention_mask.shape[0], pad_length), 
+        #                          dtype=attention_mask.dtype, device=attention_mask.device)
+        #     attention_mask = torch.cat([pad_mask, attention_mask], dim=1)
             
-        elif current_length > seq_len:
-            # 需要截断（从左侧截断，保留右侧的实际内容）
-            print("Warning: input_ids length exceed max_seq_len, will be truncated!")
-            input_ids = input_ids[:, -seq_len:]
-            attention_mask = attention_mask[:, -seq_len:]
+        # elif current_length > seq_len:
+        #     # 需要截断（从左侧截断，保留右侧的实际内容）
+        #     print("Warning: input_ids length exceed max_seq_len, will be truncated!")
+        #     input_ids = input_ids[:, -seq_len:]
+        #     attention_mask = attention_mask[:, -seq_len:]
         
         query_inputs['input_ids'] = input_ids
         query_inputs['attention_mask'] = attention_mask
@@ -291,10 +307,24 @@ class Agent(nn.Module):
         log_probs = log_probs.sum(dim=-1).reshape(-1, 1)
         # shape: [batch_size, 1]
         
-        actions = self.action_tokenizer.decode_token_ids_to_actions(action_token_ids.cpu().numpy())
+        # Extract predicted action tokens and translate into (normalized) continuous actions
+        predicted_action_token_ids = action_token_ids[0, :].cpu().numpy()
+        discretized_actions = self.vocab_size - predicted_action_token_ids
+        discretized_actions = np.clip(discretized_actions - 1, a_min=0, a_max=self.bin_centers.shape[0] - 1)
+        normalized_actions = self.bin_centers[discretized_actions]
+        # Unnormalize actions
+        action_norm_stats = self.norm_stats[self.unnorm_key]["action"]
+        mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
+        action_high, action_low = np.array(action_norm_stats["q99"]), np.array(action_norm_stats["q01"])
+        actions = np.where(
+            mask,
+            0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
+            normalized_actions,
+        )
+        actions = actions.reshape(1, -1)
 
-        # TODO: outputs.hidden_states.shape: [batch_size, seq_len, hidden_size] ?
-        hidden_states = outputs.hidden_states[-1][-1][:, 0, :]
+        # TODO: 使用第一个还是最后一个token的hidden state？
+        hidden_states = outputs.hidden_states[-1][-1][:, -1, :]
         with torch.autocast("cuda", dtype=torch.bfloat16):
             values = self.value_head(hidden_states)
 
@@ -467,7 +497,9 @@ def main():
             max_steps=args.num_steps,
             init_state_id=0,
             seed=args.seed,
-            num_envs=args.num_envs
+            num_envs=args.num_envs,
+            height=observation_space.shape[1],
+            width=observation_space.shape[2]
         )
 
     # VLA setup
@@ -483,6 +515,7 @@ def main():
         low_cpu_mem_usage=True, 
         trust_remote_code=True
     ).to(f"cuda:{distributed_state.local_process_index}")
+    vla_config = vla_base.config
 
     # LoRA setup
     lora_config = LoraConfig(
@@ -497,11 +530,14 @@ def main():
     # DDP setup
     vla_base = DDP(vla_base, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
 
-    # 用于将 action_token_id 转为 action
-    action_tokenizer = ActionTokenizer(processor.tokenizer)
-
     # agent setup
-    agent = Agent(vla_base, action_tokenizer, processor, device).to(device)
+    agent = Agent(
+        vla_base, 
+        processor, 
+        device, 
+        unnorm_key="libero_spatial",
+        vla_config=vla_config
+    ).to(device)
     
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
@@ -520,6 +556,14 @@ def main():
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
     advantages = torch.zeros((args.num_steps, args.num_envs)).to(device)
     returns = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    
+    # 用于记录指标
+    success = np.zeros((args.num_steps, args.num_envs), dtype=np.int8)
+    trajectory_images = None
+    trajectory_logger = None
+    if args.save_log and distributed_state.is_main_process:
+        trajectory_logger = TrajectoryLogger()
+        trajectory_logger.create_log_directory()
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
@@ -549,6 +593,9 @@ def main():
             obs_imgs, infos = envs.reset()
             next_done = torch.zeros(args.num_envs).to(device)
             
+            if args.save_log:
+                trajectory_images = [[] for _ in range(args.num_envs)]
+            
             print("Rollout...")
             for step in tqdm(range(0, args.num_steps), desc="Rollout Progress"):
                 global_step += args.num_envs
@@ -565,6 +612,10 @@ def main():
                     obs_img = Image.fromarray(obs_imgs[env_idx].astype(np.uint8))
                     if obs_img.mode != 'RGB':
                         obs_img = obs_img.convert('RGB')
+                    
+                    # 收集图像到轨迹记录（仅在开启log时）
+                    if args.save_log and trajectory_images is not None:
+                        trajectory_images[env_idx].append(obs_img.copy())
 
                     # 处理单个环境的输入
                     query_inputs = agent.process_to_inputs(prompt, obs_img, args.max_seq_len)
@@ -576,41 +627,50 @@ def main():
                         # 直接写入到全局轨迹tensors和actions中
                         values[step, env_idx] = value.squeeze(0)
                         logprobs[step, env_idx] = logprob.squeeze(0)
-                        traj_sequences[step, env_idx] = sequence.squeeze(0)
-                        traj_attention_mask[step, env_idx] = query_inputs['attention_mask'].squeeze(0)
+                        # TODO: rollout不加入padding，这里需要处理长度
+                        # traj_sequences[step, env_idx] = sequence.squeeze(0)
+                        # traj_attention_mask[step, env_idx] = query_inputs['attention_mask'].squeeze(0)
                         traj_obs[step, env_idx] = query_inputs['pixel_values'].squeeze(0)
                 
                 dones[step, :] = next_done
 
-                step_results = envs.step(actions)
-                if step_results is None:
-                    raise RuntimeError("环境返回None，请检查环境是否正确初始化")
-                obs_imgs, rewards_step, dones_step, truncated_step, infos = step_results
-                
-                # 记录奖励和状态
+                # TODO: 当前环境会自动重置，需要手动处理，在环境完成后不再step，否则会包含多条轨迹数据。是否影响GAE？
+                obs_imgs, rewards_step, terminated_step, truncated_step, infos = envs.step(actions)
+                # TODO: 截断的时候也视为 done 吗？如果被截断，next_value 不应该为 0
+                next_done = torch.tensor(terminated_step | truncated_step, dtype=torch.int).to(device)
+                # 记录奖励和成功状态
                 rewards[step, :] = torch.tensor(rewards_step).to(device).view(-1)
-                
-                # 处理done和truncated状态
-                # TODO: 终止和截断都视为完成吗
-                next_done = torch.tensor(dones_step | truncated_step, dtype=torch.int).to(device)
+                success[step, :] = infos['success']
 
 
             # 广义优势估计（GAE）
-            # bootstrap value if not done
             with torch.no_grad():
-                next_values = torch.zeros(args.num_envs).to(device)
                 lastgaelam = torch.zeros(args.num_envs).to(device)
                 
                 for t in reversed(range(args.num_steps)):
                     if t == args.num_steps - 1:
                         nextnonterminal = 1.0 - next_done
-                        nextvalues = next_values
+                        # TODO: bootstrap value if not terminated
+                        nextvalues = torch.zeros(args.num_envs).to(device)
                     else:
                         nextnonterminal = 1.0 - dones[t + 1]
                         nextvalues = values[t + 1]
                     delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
                     advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
                 returns = advantages + values
+            
+            # 保存每个环境的日志数据
+            if trajectory_logger is not None:
+                trajectory_logger.save_trajectories(
+                    iteration=iteration,
+                    rewards=rewards,
+                    success=success,
+                    values=values,
+                    logprobs=logprobs,
+                    advantages=advantages,
+                    returns=returns,
+                    trajectory_images=trajectory_images if trajectory_images is not None else []
+                )
         
         # broadcast数据到所有进程
         dist.barrier()
