@@ -32,7 +32,7 @@ jsonlines
 
 # Robotics and RL
 # libero  # Install separately from source (see README)
-gym==0.26.2
+gymnasium==1.2.0
 mujoco==3.3.5
 robosuite==1.4.1
 bddl==3.6.0

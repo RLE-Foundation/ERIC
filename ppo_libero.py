@@ -13,16 +13,14 @@ os.environ['CURL_CA_BUNDLE'] = ''
 import numpy as np
 import torch
 import torch.distributed as dist
-import tensorflow as tf
-import gym
-import gym.spaces
+
+import gymnasium as gym
 import time
 from typing import Optional
 from tqdm import tqdm
 
 from accelerate import PartialState
 from dataclasses import dataclass
-from PIL import Image
 from peft import LoraConfig, get_peft_model
 from torch import nn, optim
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -36,8 +34,9 @@ from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 
-from libero.libero import benchmark, get_libero_path
-from libero.libero.envs import OffScreenRenderEnv
+from libero_gym import make_libero_vec_env
+from PIL import Image
+
 
 def set_random_seed(seed: int = 42):
     """
@@ -120,7 +119,7 @@ class Args:
     learning_rate: float = 2.5e-4
     """the learning rate of the optimizer"""
     num_envs: int = 1
-    """the number of parallel game environments"""
+    """the number of parallel game environments (supports vectorized environments)"""
     num_steps: int = 250
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
@@ -129,8 +128,8 @@ class Args:
     """the discount factor gamma"""
     gae_lambda: float = 0.95
     """the lambda for the general advantage estimation"""
-    num_minibatches: int = 100
-    """the number of mini-batches"""
+    minibatch_size: int = 8
+    """the size of mini-batches"""
     update_epochs: int = 4
     """the K epochs to update the policy"""
     norm_adv: bool = True
@@ -151,147 +150,8 @@ class Args:
     # to be filled in runtime
     batch_size: int = 0
     """the batch size (computed in runtime)"""
-    minibatch_size: int = 0
-    """the mini-batch size (computed in runtime)"""
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
-
-class LiberoEnv(gym.Env):
-    def __init__(self, task_suite_name, task_id, max_steps, init_state_id):
-        """
-        Args:
-            task_suite_name (str): Name of the task suite
-            task_id (int): ID of the task
-            seed (int): Random seed
-            max_steps (int): Maximum number of steps per episode
-            init_state_id (int): ID of the initial state
-
-        Returns:
-            A LIBERO environment.
-        """
-        # Set the task information
-        self.task_id = task_id
-        self.task_suite_name = task_suite_name
-        self.max_steps = max_steps
-        self.init_state_id = init_state_id
-        
-        # Create the environment
-        benchmark_dict = benchmark.get_benchmark_dict()
-        task_suite = benchmark_dict[task_suite_name]()
-        task = task_suite.get_task(task_id)
-        self.task_name = task.name
-        self.task_description = task.language
-        self.prompt = "In: What action should the robot take to {<INSTRUCTION>}?\nOut:"
-        self.prompt = self.prompt.replace("<INSTRUCTION>", self.task_description)
-        task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
-        
-        self.env = OffScreenRenderEnv(bddl_file_name=task_bddl_file, camera_heights=128, camera_widths=128)
-
-        # Get the initial states
-        self.initial_states = task_suite.get_task_init_states(task_id)
-        self.init_state = self.initial_states[init_state_id]
-
-        # Set a step counter
-        self.current_step = 0
-        
-    def step(self, action):
-        action = self.calibrate_action(action)
-        obs, reward, done, info = self.env.step(action)
-        visual_obs = self.get_visual_obs(obs)
-
-        # Update the current step
-        self.current_step += 1
-
-        truncated = self.current_step >= self.max_steps
-        
-        # Update the info
-        info["prompt"] = self.prompt
-
-        # TODO: 日志记录这里的数据
-        return visual_obs, reward, done, truncated, info
-    
-    def reset(self, *, seed=None, options=None):
-        # Reset the environment
-        self.env.seed(seed)
-        self.env.reset()
-        # Set the initial state
-        self.env.set_state(self.init_state)
-        
-        # Run 10 dummy steps to wait for the environment to stabilize
-        dummy_action = [0.] * 7
-        obs, reward, done, info = None, None, None, {}
-        for _ in range(10):
-            obs, reward, done, info = self.env.step(dummy_action)
-        
-        # Get the visual observation
-        visual_obs = self.get_visual_obs(obs)
-
-        # Update the info
-        info['prompt'] = self.prompt
-
-        return visual_obs, info
-
-    def close(self):
-        self.env.close()
-    
-    def calibrate_action(self, action, binarize=True):
-        """
-        1. Changes gripper action (last dimension of action vector) from [0,1] to [-1,+1].
-        Necessary for some environments (not Bridge) because the dataset wrapper standardizes gripper actions to [0,1].
-        Note that unlike the other action dimensions, the gripper action is not normalized to [-1,+1] by default by
-        the dataset wrapper. Normalization formula: y = 2 * (x - orig_low) / (orig_high - orig_low) - 1
-
-        2. Flips the sign of the gripper action (last dimension of action vector).
-        This is necessary for some environments where -1 = open, +1 = close, since
-        the RLDS dataloader aligns gripper actions such that 0 = close, 1 = open.
-
-        Args:
-            action (np.ndarray): Action vector.
-            binarize (bool): Whether to binarize the gripper action.
-
-        Returns:
-            np.ndarray: Calibrated action vector.
-        """
-        # Create a copy of the input array to make it writable
-        action = np.array(action, copy=True)
-        
-        # Just normalize the last action to [-1,+1].
-        orig_low, orig_high = 0.0, 1.0
-        action[..., -1] = 2 * (action[..., -1] - orig_low) / (orig_high - orig_low) - 1
-
-        if binarize:
-            # Binarize to -1 or +1.
-            action[..., -1] = np.sign(action[..., -1])
-        
-        # Invert the gripper action
-        action[..., -1] = action[..., -1] * -1.0
-        return action
-    
-    def get_visual_obs(self, obs, resize_size=(224, 224)):
-        """
-        Get the visual observation from the environment.
-
-        Args:
-            obs (dict): Observation from the environment.
-            resize_size (tuple): Resize size of the image.
-
-        Returns:
-            np.ndarray: Visual observation.
-        """
-        agentview_image = obs['agentview_image']
-        # NOTE: rotate 180 degrees to match train preprocessing
-        agentview_image = agentview_image[::-1, ::-1]
-        # Resize to image size expected by model
-        assert isinstance(resize_size, tuple)
-        img = tf.image.encode_jpeg(agentview_image)
-        img = tf.io.decode_image(img, expand_animations=False, dtype=tf.uint8)  # Immediately decode back
-        img = tf.image.resize(img, resize_size, method="lanczos3", antialias=True)
-        img = tf.cast(tf.clip_by_value(tf.round(img), 0, 255), tf.uint8)
-        img = Image.fromarray(img.numpy())
-        img = img.convert("RGB")
-
-        return img
-
 
 class Agent(nn.Module):
     def __init__(
@@ -396,6 +256,7 @@ class Agent(nn.Module):
     def act_rollout(self, query_inputs):
         """给定inputs，返回action
         需要获取模型所有输出，不仅是 action，因此不直接调用 predict_action，而是使用 generate 方法
+        只支持 batch_size = 1
 
         Args:
             query_inputs (dict): query inputs
@@ -518,7 +379,7 @@ class PPODataset(Dataset):
         
         # 给每个样本分配连续ID，验证分布式数据采样
         self.sample_ids = torch.arange(len(sequences))
-        
+    
     def __len__(self):
         return len(self.sequences)
     
@@ -553,9 +414,13 @@ def main():
     # 参数解析与日志
     args = tyro.cli(Args)
     args.batch_size = int(args.num_envs * args.num_steps)
-    args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    
+    # 验证参数
+    if args.num_envs <= 0:
+        raise ValueError(f"num_envs必须大于0，当前值：{args.num_envs}")
+    print(f"使用{args.num_envs}个并行环境进行训练")
     if args.track:
         import wandb
 
@@ -595,9 +460,15 @@ def main():
     action_space = gym.spaces.Box(low=-1, high=1, shape=(7,), dtype=np.float32)
     envs = None
     if distributed_state.is_main_process:
-        # TODO: 没有根据num_envs设置envs，目前仅支持num_envs=1
-        assert args.num_envs == 1, "Currently only support num_envs=1"
-        envs = LiberoEnv(task_suite_name='libero_spatial', task_id=0, max_steps=args.num_steps, init_state_id=0)
+        # 使用专门的函数创建向量化环境
+        envs = make_libero_vec_env(
+            task_suite_name='libero_spatial',
+            task_id=0,
+            max_steps=args.num_steps,
+            init_state_id=0,
+            seed=args.seed,
+            num_envs=args.num_envs
+        )
 
     # VLA setup
     AutoConfig.register("openvla", OpenVLAConfig)
@@ -675,56 +546,65 @@ def main():
             
             # Reset environment at the beginning of each iteration to start a new episode
             print("Resetting environment for new episode...")
-            obs_img, info = envs.reset(seed=args.seed)
+            obs_imgs, infos = envs.reset()
             next_done = torch.zeros(args.num_envs).to(device)
             
             print("Rollout...")
             for step in tqdm(range(0, args.num_steps), desc="Rollout Progress"):
                 global_step += args.num_envs
                 
-                # 输入编码，得到 query_inputs
-                query_inputs = agent.process_to_inputs(envs.prompt, obs_img, args.max_seq_len)
-                # input_ids.shape = [num_envs, len]
-                # attention_mask.shape = [num_envs, len]
-                # pixel_values.shape = [num_envs, 6, 224, 224]
-
-                # ALGO LOGIC: action logic
-                with torch.no_grad():
-                    action, value, logprob, sequences = agent.act_rollout(query_inputs)
-                    values[step, :] = value.flatten()
+                # 供envs.step使用
+                actions = np.zeros((args.num_envs, 7), dtype=np.float32)
                 
-                # 记录轨迹数据
-                traj_sequences[step, :] = sequences
-                traj_attention_mask[step, :] = query_inputs['attention_mask']
-                traj_obs[step, :] = query_inputs['pixel_values'].to(device)
+                # 为每个环境单独调用agent（rollout函数目前只支持batch_size=1）
+                # TODO: 向量化 Rollout
+                for env_idx in range(args.num_envs):
+                    prompt = infos['prompt'][env_idx]
+                    
+                    # 将numpy数组转换为PIL Image
+                    obs_img = Image.fromarray(obs_imgs[env_idx].astype(np.uint8))
+                    if obs_img.mode != 'RGB':
+                        obs_img = obs_img.convert('RGB')
+
+                    # 处理单个环境的输入
+                    query_inputs = agent.process_to_inputs(prompt, obs_img, args.max_seq_len)
+                    
+                    # 单独调用agent获取action
+                    with torch.no_grad():
+                        action, value, logprob, sequence = agent.act_rollout(query_inputs)
+                        actions[env_idx] = action.squeeze(0)
+                        # 直接写入到全局轨迹tensors和actions中
+                        values[step, env_idx] = value.squeeze(0)
+                        logprobs[step, env_idx] = logprob.squeeze(0)
+                        traj_sequences[step, env_idx] = sequence.squeeze(0)
+                        traj_attention_mask[step, env_idx] = query_inputs['attention_mask'].squeeze(0)
+                        traj_obs[step, env_idx] = query_inputs['pixel_values'].squeeze(0)
+                
                 dones[step, :] = next_done
-                logprobs[step, :] = logprob
 
-                # TRY NOT TO MODIFY: execute the game and log data.
-                # action.shape: [batch_size, 7]
-                # TODO: 暂时不支持 batch_size > 1 时的仿真
-                obs_img, reward, done, truncated, infos = envs.step(action[0])
+                step_results = envs.step(actions)
+                if step_results is None:
+                    raise RuntimeError("环境返回None，请检查环境是否正确初始化")
+                obs_imgs, rewards_step, dones_step, truncated_step, infos = step_results
                 
-                rewards[step, :] = torch.tensor(reward).to(device).view(-1)
-                # TODO: 这里没有区分 truncate 和 done
-                next_done = torch.Tensor([done or truncated]).to(device)
+                # 记录奖励和状态
+                rewards[step, :] = torch.tensor(rewards_step).to(device).view(-1)
+                
+                # 处理done和truncated状态
+                # TODO: 终止和截断都视为完成吗
+                next_done = torch.tensor(dones_step | truncated_step, dtype=torch.int).to(device)
 
-                if "final_info" in infos:
-                    for info in infos["final_info"]:
-                        if info and "episode" in info:
-                            print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                            writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                            writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
 
             # 广义优势估计（GAE）
             # bootstrap value if not done
             with torch.no_grad():
-                next_value = torch.zeros(1, 1).to(device) # agent.get_value(next_obs).reshape(1, -1)
-                lastgaelam = 0
+                next_values = torch.zeros(args.num_envs).to(device)
+                lastgaelam = torch.zeros(args.num_envs).to(device)
+                
                 for t in reversed(range(args.num_steps)):
                     if t == args.num_steps - 1:
                         nextnonterminal = 1.0 - next_done
-                        nextvalues = next_value
+                        nextvalues = next_values
                     else:
                         nextnonterminal = 1.0 - dones[t + 1]
                         nextvalues = values[t + 1]
