@@ -557,7 +557,7 @@ def main():
     advantages = torch.zeros((args.num_steps, args.num_envs)).to(device)
     returns = torch.zeros((args.num_steps, args.num_envs)).to(device)
     
-    # 用于记录指标
+    # 用于记录指标，action 后是否成功
     success = np.zeros((args.num_steps, args.num_envs), dtype=np.int8)
     trajectory_images = None
     trajectory_logger = None
@@ -669,6 +669,7 @@ def main():
                     logprobs=logprobs,
                     advantages=advantages,
                     returns=returns,
+                    dones=dones,
                     trajectory_images=trajectory_images if trajectory_images is not None else []
                 )
         
@@ -679,6 +680,7 @@ def main():
         dist.broadcast(traj_attention_mask, src=0)
         dist.broadcast(logprobs, src=0)
         dist.broadcast(rewards, src=0)
+        dist.broadcast(dones, src=0)
         dist.broadcast(advantages, src=0)
         dist.broadcast(values, src=0)
         dist.broadcast(returns, src=0)
