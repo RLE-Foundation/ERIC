@@ -295,15 +295,15 @@ class Agent(nn.Module):
         )
 
         action_token_ids = outputs.sequences[:, -7:]
-        # shape: [batch_size, 7]
+        # shape: [batch_size, seq_len]
         
         # TODO: batch_size > 1 时，可能有问题
-        logits = torch.concat(outputs.logits, dim=0)
-        # shape: [batch_size * 7, vocab_size]
+        logits = torch.concat(outputs.logits, dim=0).reshape(1, 7, -1)
+        # shape: [batch_size, seq_len, vocab_size]
         
         # 一整个 action（7个token） 对应一个 log_probs
         log_probs = torch.log_softmax(logits, dim=-1)
-        log_probs = log_probs.gather(dim=-1, index=action_token_ids)
+        log_probs = log_probs.gather(dim=-1, index=action_token_ids.unsqueeze(-1)).squeeze(-1)
         log_probs = log_probs.sum(dim=-1).reshape(-1, 1)
         # shape: [batch_size, 1]
         
@@ -328,13 +328,23 @@ class Agent(nn.Module):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             values = self.value_head(hidden_states)
 
-        return actions, values, log_probs, outputs.sequences
+        # 构造完整的 attention_mask 和 sequences，用于后续梯度计算
+        sequences = outputs.sequences
+        attention_mask = torch.cat(
+            (
+                query_inputs['attention_mask'], 
+                torch.ones((1, 7), device=query_inputs['attention_mask'].device, dtype=torch.long)
+            ),
+            dim=1
+        )
+        assert sequences.shape[1] == attention_mask.shape[1], f"sequences.shape[1] != attention_mask.shape[1]"
+        return actions, values, log_probs, sequences, attention_mask
 
     def encode_traj(self, sequences, attention_mask, pixel_values):
         """对已经采集的动作重新编码一次，用于计算梯度
 
         Args:
-            sequences (torch.Tensor): shape: [batch_size, max_seq_len + 7] 包含完整的输入序列和action tokens
+            sequences (torch.Tensor): shape: [batch_size, max_seq_len] 包含完整的输入序列和action tokens
             attention_mask (torch.Tensor): shape: [batch_size, max_seq_len]
             pixel_values (torch.Tensor): shape: [batch_size, 6, 224, 224]
         
@@ -342,41 +352,53 @@ class Agent(nn.Module):
             action_log_probs (torch.Tensor): shape: [batch_size] 动作的对数概率
             values (torch.Tensor): shape: [batch_size] 状态值
         """
-        # 扩展attention_mask以匹配sequences的长度
-        batch_size, seq_len = sequences.shape
-        extended_attention_mask = torch.ones(batch_size, seq_len, device=attention_mask.device, dtype=attention_mask.dtype)
-        extended_attention_mask[:, :attention_mask.shape[1]] = attention_mask
+        assert sequences.shape[1] == attention_mask.shape[1], f"sequences.shape[1] != attention_mask.shape[1]"
         
         # 直接使用完整的sequences进行前向传播
         outputs = self.vla_base(
             input_ids=sequences,
-            attention_mask=extended_attention_mask,
+            attention_mask=attention_mask,
             pixel_values=pixel_values,
             output_hidden_states=True,
             return_dict=True,
         )
+        batch_size = sequences.shape[0]
+        seq_len = sequences.shape[1]
+        # 获取logits，去掉开头的图片token
+        logits = outputs.logits[:, -seq_len:, :]  # [batch_size, seq_len, vocab_size]
         
-        # 获取logits
-        logits = outputs.logits  # [batch_size, seq_len, vocab_size]
+        # 找到最后一个mask=1的位置
+        batch_indices = torch.arange(batch_size, device=attention_mask.device)
+        flipped_mask = torch.flip(attention_mask, dims=[1])
         
-        # logits[:, -8:-1, :] 对应预测 sequences[:, -7:] (最后7个action tokens)
-        action_logits = logits[:, -8:-1, :]  # [batch_size, 7, vocab_size]
+        # 输入序列中最后一个 action 的位置
+        last_valid_pos = seq_len - 1 - torch.argmax(flipped_mask.float(), dim=1)  # [batch_size]
+        # 输入序列中，第一个 action 的位置
+        action_start_pos = last_valid_pos - 6  # [batch_size]
+        action_positions = action_start_pos.unsqueeze(1) + torch.arange(7, device=attention_mask.device)  # [batch_size, 7]
         
-        # 获取最后7个位置的token ids（对应action tokens）
-        action_token_ids = sequences[:, -7:]  # [batch_size, 7]
+        # 检查最后7个位置的和是否为7（即都是1且连续）
+        action_mask_sum = attention_mask[batch_indices.unsqueeze(1), action_positions].sum(dim=1)  # [batch_size]
+        invalid_mask = action_mask_sum != 7
+        if invalid_mask.any():
+            invalid_indices = torch.where(invalid_mask)[0]
+            raise ValueError(f"样本 {invalid_indices.tolist()} 的attention_mask最后7个位置不全为1或不连续")
+        
+        # 向量化提取action logits和token ids
+        # 输出序列中，用来预测 action 对应的 logits 位置
+        logit_positions = action_positions - 1  # [batch_size, 7]
+        action_logits = logits[batch_indices.unsqueeze(1), logit_positions]  # [batch_size, 7, vocab_size]
+        action_token_ids = sequences[batch_indices.unsqueeze(1), action_positions]  # [batch_size, 7]
         
         # 计算log probabilities
         log_probs = torch.log_softmax(action_logits, dim=-1)  # [batch_size, 7, vocab_size]
-        
-        # 获取实际选择的action tokens的log prob
         action_log_probs = log_probs.gather(dim=-1, index=action_token_ids.unsqueeze(-1)).squeeze(-1)  # [batch_size, 7]
-        
-        # 对整个action序列求和得到总的log prob
         action_log_probs = action_log_probs.sum(dim=-1)  # [batch_size]
         
-        # 计算value
-        hidden_states = outputs.hidden_states[-1][:, -1, :].float()  # [batch_size, hidden_size]
-        values = self.value_head(hidden_states).squeeze(-1)  # [batch_size]
+        # 向量化计算value
+        hidden_states = outputs.hidden_states[-1]  # [batch_size, seq_len, hidden_size]
+        last_hidden = hidden_states[batch_indices, last_valid_pos]  # [batch_size, hidden_size]
+        values = self.value_head(last_hidden.float()).squeeze(-1)  # [batch_size]
         
         return action_log_probs, values
 
@@ -388,7 +410,7 @@ class PPODataset(Dataset):
     def __init__(self, sequences, attention_mask, pixel_values, logprobs, advantages, returns, values):
         """
         Args:
-            sequences (torch.Tensor): [batch_size, max_seq_len + 7] 完整的输入序列和action tokens
+            sequences (torch.Tensor): [batch_size, max_seq_len] 完整的输入序列和action tokens
             attention_mask (torch.Tensor): [batch_size, max_seq_len] 注意力掩码
             pixel_values (torch.Tensor): [batch_size, 6, 224, 224] 图像数据
             logprobs (torch.Tensor): [batch_size] 动作的对数概率
@@ -545,9 +567,10 @@ def main():
     # 收集数据，在所有 GPU 上创建一份，rollout结束后，子进程会从主进程接收广播数据
     # 轨迹数据，用于计算梯度
     traj_obs = torch.zeros((args.num_steps, args.num_envs) + observation_space.shape, dtype=torch.bfloat16).to(device)
+    # 包含 action 的完整输出序列
     traj_attention_mask = torch.zeros((args.num_steps, args.num_envs, args.max_seq_len), dtype=torch.long).to(device)
-    # 加入 padding 后的完整输出序列，用于再次计算梯度
-    traj_sequences = torch.zeros((args.num_steps, args.num_envs, args.max_seq_len + 7), dtype=torch.long).to(device)
+    # 加入 action 对应 mask 的完整 mask
+    traj_sequences = torch.zeros((args.num_steps, args.num_envs, args.max_seq_len), dtype=torch.long).to(device)
     
     # RL 算法需要的数据
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -592,6 +615,7 @@ def main():
             print("Resetting environment for new episode...")
             obs_imgs, infos = envs.reset()
             next_done = torch.zeros(args.num_envs).to(device)
+            traj_attention_mask.zero_()
             
             if args.save_log:
                 trajectory_images = [[] for _ in range(args.num_envs)]
@@ -622,19 +646,19 @@ def main():
                     
                     # 单独调用agent获取action
                     with torch.no_grad():
-                        action, value, logprob, sequence = agent.act_rollout(query_inputs)
+                        action, value, logprob, sequence, attention_mask = agent.act_rollout(query_inputs)
                         actions[env_idx] = action.squeeze(0)
-                        # 直接写入到全局轨迹tensors和actions中
+                        # 直接写入到全局轨迹数据中
                         values[step, env_idx] = value.squeeze(0)
                         logprobs[step, env_idx] = logprob.squeeze(0)
-                        # TODO: rollout不加入padding，这里需要处理长度
-                        # traj_sequences[step, env_idx] = sequence.squeeze(0)
-                        # traj_attention_mask[step, env_idx] = query_inputs['attention_mask'].squeeze(0)
+                        assert sequence.shape[1] <= args.max_seq_len and attention_mask.shape[1] <= args.max_seq_len, \
+                            f"sequence.shape[1]={sequence.shape[1]} > args.max_seq_len={args.max_seq_len} or attention_mask.shape[1]={attention_mask.shape[1]} > args.max_seq_len={args.max_seq_len}"
+                        traj_sequences[step, env_idx, :sequence.shape[1]] = sequence.squeeze(0)
+                        traj_attention_mask[step, env_idx, :attention_mask.shape[1]] = attention_mask.squeeze(0)
                         traj_obs[step, env_idx] = query_inputs['pixel_values'].squeeze(0)
                 
                 dones[step, :] = next_done
 
-                # TODO: 当前环境会自动重置，需要手动处理，在环境完成后不再step，否则会包含多条轨迹数据。是否影响GAE？
                 obs_imgs, rewards_step, terminated_step, truncated_step, infos = envs.step(actions)
                 # TODO: 截断的时候也视为 done 吗？如果被截断，next_value 不应该为 0
                 next_done = torch.tensor(terminated_step | truncated_step, dtype=torch.int).to(device)
@@ -691,7 +715,7 @@ def main():
         # ==================================================================================================================
         # NOTE: all the GPUs will do the update together
         # flatten the batch
-        b_sequences = traj_sequences.reshape((-1, args.max_seq_len + 7))
+        b_sequences = traj_sequences.reshape((-1, args.max_seq_len))
         b_attention_mask = traj_attention_mask.reshape((-1, args.max_seq_len))
         b_pixel_values = traj_obs.reshape((-1,) + observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
