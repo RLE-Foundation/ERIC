@@ -16,6 +16,8 @@ import torch.distributed as dist
 
 import gymnasium as gym
 import time
+import json
+from pathlib import Path
 from typing import Optional, Dict
 from tqdm import tqdm
 
@@ -74,6 +76,37 @@ def set_random_seed(seed: int = 42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
+def setup_logging_system(args) -> tuple[str, Path]:
+    """
+    设置统一的日志系统，创建日志目录并保存参数
+    
+    Args:
+        args: 命令行参数对象
+        
+    Returns:
+        tuple[str, Path]: (run_name, log_dir) 运行名称和日志目录路径
+    """
+    # 生成运行名称，使用时间字符串作为后缀
+    run_name = f"{args.exp_name}_{time.strftime('%Y%m%d_%H%M%S')}"
+    
+    # 创建日志目录
+    log_dir = Path("logs") / run_name
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 保存参数到JSON文件以便复现
+    args_dict = vars(args)
+    args_file = log_dir / "args.json"
+    with args_file.open('w', encoding='utf-8') as f:
+        json.dump(args_dict, f, indent=2, ensure_ascii=False, default=str)
+    
+    print(f"日志系统初始化完成:")
+    print(f"  运行名称: {run_name}")
+    print(f"  日志目录: {log_dir}")
+    print(f"  参数文件: {args_file}")
+    
+    return run_name, log_dir
+
 # Call the function to set random seed for reproducibility
 # set_random_seed(42)
 
@@ -89,16 +122,12 @@ class Args:
     """seed of the experiment"""
     torch_deterministic: bool = True
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
-    cuda: bool = True
-    """if toggled, cuda will be enabled by default"""
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "cleanVLA-RL"
     """the wandb's project name"""
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
-    capture_video: bool = False
-    """whether to capture videos of the agent performances (check out `videos` folder)"""
     debug: bool = False
     """whether to use debugpy"""
     save_log: bool = False
@@ -115,8 +144,6 @@ class Args:
     """the maximum sequence length of the input"""
 
     # Algorithm specific arguments
-    env_id: str = "BreakoutNoFrameskip-v4"
-    """the id of the environment"""
     total_timesteps: int = 10000000
     """total timesteps of the experiments"""
     learning_rate: float = 2.5e-4
@@ -467,12 +494,15 @@ def main():
     args = tyro.cli(Args)
     args.batch_size = int(args.num_envs * args.num_steps)
     args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    
+    # 设置统一的日志系统
+    run_name, log_dir = setup_logging_system(args)
     
     # 验证参数
     if args.num_envs <= 0:
         raise ValueError(f"num_envs必须大于0，当前值：{args.num_envs}")
     print(f"使用{args.num_envs}个并行环境进行训练")
+    
     if args.track:
         import wandb
 
@@ -485,7 +515,10 @@ def main():
             monitor_gym=True,
             save_code=True,
         )
-    writer = SummaryWriter(f"runs/{run_name}")
+    
+    # 创建tensorboard writer，使用统一的日志目录下的tensorboard子目录
+    tensorboard_dir = log_dir / "tensorboard"
+    writer = SummaryWriter(str(tensorboard_dir))
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
@@ -585,7 +618,8 @@ def main():
     trajectory_images = None
     trajectory_logger = None
     if args.save_log and distributed_state.is_main_process:
-        trajectory_logger = TrajectoryLogger()
+        # 使用统一的日志目录作为 TrajectoryLogger 的基础目录
+        trajectory_logger = TrajectoryLogger(base_dir=str(log_dir / "trajectory"))
         trajectory_logger.create_log_directory()
 
     # TRY NOT TO MODIFY: start the game

@@ -1,8 +1,8 @@
-import os
 import csv
 import imageio
 import numpy as np
 from datetime import datetime
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 from PIL import Image, ImageDraw, ImageFont
 import torch
@@ -20,19 +20,21 @@ class TrajectoryLogger:
         Args:
             base_dir (str): 基础日志目录
         """
-        self.base_dir = base_dir
+        self.base_dir = Path(base_dir)
         self.log_dir = None
         self.date_time = datetime.now().strftime("%Y%m%d_%H%M%S")
         
-    def create_log_directory(self) -> str:
+    def create_log_directory(self) -> Path:
         """
-        创建日志目录，每次运行都创建一个新的文件夹
+        创建或设置日志目录
+        如果 base_dir 已经是完整的运行目录（包含时间戳），则直接使用
+        否则创建一个新的时间戳子目录
         
         Returns:
-            str: 创建的日志目录路径
+            Path: 创建的日志目录路径
         """
-        self.log_dir = os.path.join(self.base_dir, f"run_{self.date_time}")
-        os.makedirs(self.log_dir, exist_ok=True)
+        self.log_dir = self.base_dir
+        self.log_dir.mkdir(parents=True, exist_ok=True)
         print(f"轨迹数据将保存到: {self.log_dir}")
         return self.log_dir
     
@@ -92,7 +94,7 @@ class TrajectoryLogger:
             
             print(f"环境 {env_idx} 轨迹数据已保存（最终状态: {'成功' if final_success else '失败'}）")
     
-    def _get_trajectory_filename(self, iteration: int, env_idx: int, success: bool) -> str:
+    def _get_trajectory_filename(self, iteration: int, env_idx: int, success: bool) -> Path:
         """
         生成轨迹文件名
         
@@ -102,37 +104,37 @@ class TrajectoryLogger:
             success (bool): 是否成功
             
         Returns:
-            str: 文件路径（不包含扩展名）
+            Path: 文件路径（不包含扩展名）
         """
         if self.log_dir is None:
             raise ValueError("Log directory has not been created. Call create_log_directory() first.")
         
         success_str = "success" if success else "fail"
         filename = f"iteration_{iteration:04d}_env_{env_idx}__{success_str}"
-        return os.path.join(self.log_dir, filename)
+        return self.log_dir / filename
     
-    def _save_video(self, images: List[Image.Image], filepath: str, fps: int = 30, 
-                   add_text: bool = False, trajectory_data: Optional[List[Dict[str, Any]]] = None) -> str:
+    def _save_video(self, images: List[Image.Image], filepath: Path, fps: int = 30, 
+                   add_text: bool = False, trajectory_data: Optional[List[Dict[str, Any]]] = None) -> Path:
         """
         将图像序列保存为视频文件
         
         Args:
             images (List[Image.Image]): PIL Image对象的列表
-            filepath (str): 保存的视频文件路径（不包含扩展名）
+            filepath (Path): 保存的视频文件路径（不包含扩展名）
             fps (int): 视频帧率
             add_text (bool): 是否在视频帧上添加文字信息
             trajectory_data (List[Dict[str, Any]]): 轨迹数据，用于添加文字信息
             
         Returns:
-            str: 保存的视频文件路径
+            Path: 保存的视频文件路径
         """
         if not images:
-            return ""
+            return Path()
         
-        video_path = f"{filepath}.mp4"
+        video_path = filepath.with_suffix('.mp4')
         
         # 使用imageio保存视频，参考eval.py中的实现
-        video_writer = imageio.get_writer(video_path, fps=fps)
+        video_writer = imageio.get_writer(str(video_path), fps=fps)
         
         for idx, img in enumerate(images):
             if isinstance(img, Image.Image):
@@ -214,21 +216,21 @@ class TrajectoryLogger:
         
         return img_with_text
     
-    def _save_csv(self, trajectory_data: List[Dict[str, Any]], filepath: str) -> str:
+    def _save_csv(self, trajectory_data: List[Dict[str, Any]], filepath: Path) -> Path:
         """
         将轨迹数据保存为CSV文件
         
         Args:
             trajectory_data (List[Dict[str, Any]]): 轨迹数据列表，每个元素是一个字典
-            filepath (str): 保存的CSV文件路径（不包含扩展名）
+            filepath (Path): 保存的CSV文件路径（不包含扩展名）
             
         Returns:
-            str: 保存的CSV文件路径
+            Path: 保存的CSV文件路径
         """
         if not trajectory_data:
-            return ""
+            return Path()
         
-        csv_path = f"{filepath}.csv"
+        csv_path = filepath.with_suffix('.csv')
         
         # 获取所有字段名
         fieldnames = set()
@@ -237,7 +239,7 @@ class TrajectoryLogger:
         fieldnames = sorted(list(fieldnames))
         
         # 写入CSV文件
-        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+        with csv_path.open('w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(trajectory_data)
