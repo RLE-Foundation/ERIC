@@ -103,7 +103,7 @@ class Args:
     """whether to use debugpy"""
 
     # VLA arguments
-    vla_model_path: str = "/home/zixiao/models/openvla-7b-finetuned-libero-spatial"
+    vla_model_path: str = "/inspire/hdd/project/robot3d/public/huggingface/hub/models--openvla--openvla-7b/snapshots/31f090d05236101ebfc381b61c674dd4746d4ce0"
     """the path to the VLA model"""
     lora_rank: int = 32
     """the rank of the LoRA matrix"""
@@ -574,6 +574,7 @@ def main():
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
+    timers = {}
     
     # 调试设置 - 只在rank 0进程中启用远程调试
     if int(os.environ.get('LOCAL_RANK', 0)) == 0 and args.debug:
@@ -665,6 +666,8 @@ def main():
         print("================================================================================")
         print(f"iteration {iteration}/{args.num_iterations}")
         print("================================================================================")
+
+        iteration_start_time = time.perf_counter() # Time for iteration
         
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
@@ -676,6 +679,9 @@ def main():
         # Stage 1, 2: Rollout, Compute Data
         # ==================================================================================================================
         # NOTE: only the main process will do the action
+
+        rollout_start_time = time.perf_counter() # Time for rollout
+
         if distributed_state.is_main_process:
             assert obs_img is not None and next_done is not None and envs is not None
             
@@ -733,6 +739,8 @@ def main():
                 returns = advantages + values
         
         # broadcast数据到所有进程
+        sync_start_time = time.perf_counter() # Time for synchronization
+
         dist.barrier()
         dist.broadcast(traj_obs, src=0)
         dist.broadcast(traj_sequences, src=0)
@@ -743,12 +751,19 @@ def main():
         dist.broadcast(values, src=0)
         dist.broadcast(returns, src=0)
 
+        timers["time/data_synchronization"] = time.perf_counter() - sync_start_time
+
+        timers["time/rollout_and_gae"] = time.perf_counter() - rollout_start_time
+
 
         # ==================================================================================================================
         # Stage 3: Update
         # ==================================================================================================================
         # NOTE: all the GPUs will do the update together
         # flatten the batch
+
+        update_start_time = time.perf_counter() # Time for update
+
         b_sequences = traj_sequences.reshape((-1, args.max_seq_len + 7))
         b_attention_mask = traj_attention_mask.reshape((-1, args.max_seq_len))
         b_pixel_values = traj_obs.reshape((-1,) + observation_space.shape)
@@ -872,10 +887,27 @@ def main():
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
 
+        torch.cuda.synchronize() # <--- 确保更新步骤的GPU操作全部完成
+
+        timers["time/update_phase"] = time.perf_counter() - update_start_time
+
+        timers["time/total_iteration"] = time.perf_counter() - iteration_start_time
+
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
+        # Record time spent
+        for name, duration in timers.items():
+            writer.add_scalar(f"performance/{name}", duration, global_step)
+        
+        print(f"--- Performance Breakdown for Iteration {iteration} ---")
+        for name, duration in sorted(timers.items()):
+            print(f"{name:<30}: {duration:.4f}s")
+        print("-------------------------------------------------")
+        
+        timers.clear()
+        
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
