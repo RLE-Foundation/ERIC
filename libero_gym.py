@@ -18,7 +18,17 @@ from libero.libero.envs import OffScreenRenderEnv
 
 
 class LiberoEnv(gym.Env):
-    def __init__(self, task_suite_name, task_id, max_steps, init_state_id, seed, height=128, width=128):
+    def __init__(
+        self, 
+        task_suite_name, 
+        task_id, 
+        max_steps, 
+        init_state_id, 
+        seed, 
+        height=128, 
+        width=128,
+        step_reward=-0.1,
+    ):
         """
         Args:
             task_suite_name (str): Name of the task suite
@@ -38,6 +48,7 @@ class LiberoEnv(gym.Env):
         self.seed = seed
         self.height = height
         self.width = width
+        self.step_reward = step_reward
         
         # Create the environment
         benchmark_dict = benchmark.get_benchmark_dict()
@@ -75,13 +86,16 @@ class LiberoEnv(gym.Env):
         # Update the info
         info["prompt"] = self.prompt
         info["success"] = done
+        
+        if not done:
+            reward += self.step_reward
 
         return visual_obs, reward, done, truncated, info
     
     def reset(self, *, seed=None, options=None):
         if seed:
             self.seed = seed
-         
+        
         # Reset the environment
         self.env.seed(self.seed)
         self.env.reset()
