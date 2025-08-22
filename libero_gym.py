@@ -102,6 +102,8 @@ class LiberoEnv(gym.Env):
         # Set the initial state
         self.env.set_state(self.init_state)
         
+        self.current_step = 0
+        
         # Run 10 dummy steps to wait for the environment to stabilize
         dummy_action = [0.] * 7
         obs, reward, done, info = None, None, None, {}
